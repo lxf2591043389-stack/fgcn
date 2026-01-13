@@ -1,0 +1,15 @@
+{
+  "default": "tofdc",
+  "datasets": {
+    "tofdc": {
+      "type": "tofdc",
+      "root": "../../tofDC/TOFDC",
+      "depth_scale": 1000.0
+    },
+    "diml": {
+      "type": "diml",
+      "root": "diml",
+      "depth_scale": 1000.0
+    }
+  }
+}

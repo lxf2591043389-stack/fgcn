@@ -1,0 +1,66 @@
+{
+  "common": {
+    "data_root": "",
+    "project_root": "experiments",
+    "datasets": "tofdc",
+    "dataset_cfg": "dataset_config.json",
+    "num_workers": 0,
+    "mask_is_valid": false,
+    "light_ckpt": "",
+    "heavy_ckpt": "",
+    "save_images": true,
+    "max_depth_vis": 5.0
+  },
+  "test": {
+    "split": "test",
+    "stage": "C",
+    "batch_size": 1
+  },
+  "scheduler": {
+    "k_max": 32,
+    "tau_miss": 0.01,
+    "dilation_r": 1,
+    "lam": 0.7,
+    "delta_max": 0.30
+  },
+  "test_scheduler": {
+    "adaptive_k": true,
+    "tau_miss": 0.03,
+    "risk_top_ratio": 0.1,
+    "k_min": 4
+  },
+  "train": {
+    "batch_size_train": 8,
+    "batch_size_eval": 2,
+    "batch_size_train_a": 8,
+    "batch_size_eval_a": 2,
+    "batch_size_train_b": 2,
+    "batch_size_eval_b": 1,
+    "batch_size_train_c": 2,
+    "batch_size_eval_c": 1,
+    "stage": "all",
+    "epochs_a": 40,
+    "epochs_b": 50,
+    "epochs_c": 25,
+    "tau_c": 0.05,
+    "theta_l": 0.2,
+    "theta_h": 0.8,
+    "alpha": 1.5,
+    "beta": 2.0,
+    "gamma": 2.0,
+    "s0": 6.0,
+    "lr_light_a": 0.001,
+    "lr_heavy_b": 0.001,
+    "lr_heavy_c": 0.00008,
+    "lr_light_c": 0.000008,
+    "lambda_c_a": 0.15,
+    "lambda_c_c": 0.03,
+    "eta_c": 0.05,
+    "weight_decay": 0.0005,
+    "grad_clip": 0.5
+  },
+  "loss": {
+    "smooth_weight": 0.1,
+    "final_weight": 0.8
+  }
+}
