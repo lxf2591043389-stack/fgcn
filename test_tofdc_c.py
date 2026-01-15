@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import time
 
@@ -7,12 +8,13 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from dataset_factory import build_dataset
+from config_utils import load_run_config
+from dataset_factory import build_dataset, load_dataset_config, resolve_dataset_name
 import utils
 from models.light_proxy_net import GlobalProxyNet
 from models.heavy_refiner import HeavyRefineHead
 from models.scheduler import tile_scheduler
-from test_tofdc_config import add_base_args, add_heavy_args, add_scheduler_args
+from test_tofdc_config import RUN_CONFIG_PATH, add_base_args, add_heavy_args, add_scheduler_args
 
 SAFE_THRESH = 0.6
 BUFFER = 0.1
@@ -192,6 +194,18 @@ def main():
     parser.add_argument("--light_source", default="c", choices=["a", "c"])
     args = parser.parse_args()
 
+    run_cfg = load_run_config(RUN_CONFIG_PATH)
+    dataset_cfg = {}
+    dataset_name = args.datasets
+    dataset_root = args.data_root
+    try:
+        dataset_cfg = load_dataset_config(args.dataset_cfg)
+        dataset_name = resolve_dataset_name(args.datasets, dataset_cfg)
+        ds_cfg = dataset_cfg.get("datasets", {}).get(dataset_name, {})
+        dataset_root = args.data_root if args.data_root else ds_cfg.get("root")
+    except Exception as exc:
+        dataset_cfg = {"error": str(exc)}
+
     result_dir = os.path.join(args.project_root, f"result_{args.datasets}")
     run_id = time.strftime("%Y%m%d_%H%M%S")
     save_dir = os.path.join(result_dir, f"test_results_c_{run_id}")
@@ -271,6 +285,24 @@ def main():
         f.write(f"time: {avg_time * 1000:.2f} ms/img\n")
         f.write(f"fps: {fps:.2f}\n")
         f.write(f"save_dir: {save_dir}\n")
+        f.write("\n=== Checkpoints ===\n")
+        f.write(f"light_ckpt: {light_ckpt}\n")
+        f.write(f"heavy_ckpt: {heavy_ckpt}\n")
+        f.write("\n=== Args ===\n")
+        f.write(json.dumps(vars(args), sort_keys=True, indent=2, ensure_ascii=True))
+        f.write("\n")
+        f.write("\n=== Run Config ===\n")
+        f.write(json.dumps(run_cfg, sort_keys=True, indent=2, ensure_ascii=True))
+        f.write("\n")
+        f.write("\n=== Train Config ===\n")
+        f.write(json.dumps(run_cfg.get("train", {}), sort_keys=True, indent=2, ensure_ascii=True))
+        f.write("\n")
+        f.write("\n=== Dataset Config ===\n")
+        f.write(f"dataset_name: {dataset_name}\n")
+        f.write(f"dataset_root: {dataset_root}\n")
+        f.write(f"dataset_cfg_path: {args.dataset_cfg}\n")
+        f.write(json.dumps(dataset_cfg, sort_keys=True, indent=2, ensure_ascii=True))
+        f.write("\n")
 
     print("=== Test C Results ===")
     print(f"samples: {total_samples}")
