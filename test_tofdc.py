@@ -14,9 +14,12 @@ from models.heavy_refiner import HeavyRefineHead
 from models.scheduler import tile_scheduler
 from test_tofdc_config import add_base_args, add_heavy_args, add_scheduler_args, add_stage_args
 
-LOW_CONF_THRESH = 0.3
+SAFE_THRESH = 0.6
+BUFFER = 0.1
+PATCH_SIZE = 32
+STRIDE = 16
 
-def crop_tile_patches(I, D_in, D_light, M, C_init, tiles):
+def crop_tile_patches(I, D_in, D_light, M, C_init, tiles, stride=PATCH_SIZE):
     bsz = I.shape[0]
     ksz = tiles.shape[1]
     tiles_list = tiles.detach().cpu().tolist()
@@ -30,17 +33,21 @@ def crop_tile_patches(I, D_in, D_light, M, C_init, tiles):
     for b in range(bsz):
         for k in range(ksz):
             i, j = tiles_list[b][k]
-            y0 = int(i) * 32
-            x0 = int(j) * 32
-            I_patch = I[b:b + 1, :, y0:y0 + 32, x0:x0 + 32]
-            D_in_patch = D_in[b:b + 1, :, y0:y0 + 32, x0:x0 + 32]
-            D_light_patch = D_light[b:b + 1, :, y0:y0 + 32, x0:x0 + 32]
-            M_patch = M[b:b + 1, :, y0:y0 + 32, x0:x0 + 32]
+            y0 = int(i) * stride
+            x0 = int(j) * stride
+            if y0 + PATCH_SIZE > I.shape[2] or x0 + PATCH_SIZE > I.shape[3]:
+                continue
+            I_patch = I[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE]
+            D_in_patch = D_in[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE]
+            D_light_patch = D_light[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE]
+            M_patch = M[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE]
 
-            y1 = int(i) * 8
-            x1 = int(j) * 8
-            C_tile = C_init[b:b + 1, :, y1:y1 + 8, x1:x1 + 8]
-            C_patch = F.interpolate(C_tile, size=(32, 32), mode="bilinear", align_corners=False)
+            c_stride = stride // 4
+            c_size = PATCH_SIZE // 4
+            y1 = int(i) * c_stride
+            x1 = int(j) * c_stride
+            C_tile = C_init[b:b + 1, :, y1:y1 + c_size, x1:x1 + c_size]
+            C_patch = F.interpolate(C_tile, size=(PATCH_SIZE, PATCH_SIZE), mode="bilinear", align_corners=False)
 
             I_patches.append(I_patch)
             D_in_patches.append(D_in_patch)
@@ -48,6 +55,8 @@ def crop_tile_patches(I, D_in, D_light, M, C_init, tiles):
             M_patches.append(M_patch)
             C_patches.append(C_patch)
 
+    if not I_patches:
+        return None, None, None, None, None
     I_patch = torch.cat(I_patches, dim=0)
     D_in_patch = torch.cat(D_in_patches, dim=0)
     D_light_patch = torch.cat(D_light_patches, dim=0)
@@ -56,25 +65,61 @@ def crop_tile_patches(I, D_in, D_light, M, C_init, tiles):
     return I_patch, D_in_patch, D_light_patch, M_patch, C_patch
 
 
-def scatter_residual(res_patch, tiles, B, H=192, W=288):
+def scatter_residual(res_patch, tiles, B, H=192, W=288, stride=PATCH_SIZE):
     ksz = tiles.shape[1]
     res_full = res_patch.new_zeros((B, 1, H, W))
-    res_patch = res_patch.view(B, ksz, 1, 32, 32)
+    count = res_patch.new_zeros((B, 1, H, W))
+    res_patch = res_patch.view(B, ksz, 1, PATCH_SIZE, PATCH_SIZE)
     tiles_list = tiles.detach().cpu().tolist()
 
     for b in range(B):
         for k in range(ksz):
             i, j = tiles_list[b][k]
-            y0 = int(i) * 32
-            x0 = int(j) * 32
-            res_full[b:b + 1, :, y0:y0 + 32, x0:x0 + 32] += res_patch[b, k]
+            y0 = int(i) * stride
+            x0 = int(j) * stride
+            if y0 + PATCH_SIZE > H or x0 + PATCH_SIZE > W:
+                continue
+            res_full[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE] += res_patch[b, k]
+            count[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE] += 1.0
 
+    res_full = res_full / torch.clamp(count, min=1.0)
     return res_full
 
 
-def compute_update_mask(M_patch, C_patch, thresh=LOW_CONF_THRESH):
-    low_confidence_area = (C_patch < thresh).float()
-    return torch.max(M_patch, low_confidence_area)
+def compute_update_mask(mask_hole, conf, safe_thresh=SAFE_THRESH, buffer=BUFFER):
+    soft_edge = torch.clamp((safe_thresh - conf) / buffer, 0.0, 1.0)
+    return torch.max(mask_hole, soft_edge)
+
+
+def expand_tiles_for_overlap(tiles, H, W, base_stride=PATCH_SIZE, stride=STRIDE):
+    bsz = tiles.shape[0]
+    tiles_list = tiles.detach().cpu().tolist()
+    expanded = []
+    max_len = 0
+    for b in range(bsz):
+        coords = set()
+        for i, j in tiles_list[b]:
+            y0 = int(i) * base_stride
+            x0 = int(j) * base_stride
+            for dy in (0, stride):
+                for dx in (0, stride):
+                    yy = y0 + dy
+                    xx = x0 + dx
+                    if yy + PATCH_SIZE <= H and xx + PATCH_SIZE <= W:
+                        coords.add((yy // stride, xx // stride))
+        if not coords:
+            coords = {(0, 0)}
+        coords_list = sorted(coords)
+        expanded.append(coords_list)
+        max_len = max(max_len, len(coords_list))
+
+    out = torch.zeros((bsz, max_len, 2), dtype=torch.long, device=tiles.device)
+    for b in range(bsz):
+        coords_list = expanded[b]
+        if len(coords_list) < max_len:
+            coords_list = coords_list + [coords_list[-1]] * (max_len - len(coords_list))
+        out[b] = torch.tensor(coords_list, dtype=torch.long, device=tiles.device)
+    return out
 
 
 def forward_heavy(light, heavy, I, D_in, M, args):
@@ -91,13 +136,20 @@ def forward_heavy(light, heavy, I, D_in, M, args):
         risk_top_ratio=args.risk_top_ratio,
         k_min=args.k_min,
     )
+    tiles = expand_tiles_for_overlap(tiles, H=I.shape[2], W=I.shape[3])
     I_patch, D_in_patch, D_light_patch, M_patch, C_patch = crop_tile_patches(
-        I, D_in, D_light, M, C_init, tiles
+        I, D_in, D_light, M, C_init, tiles, stride=STRIDE
     )
-    delta_raw = heavy(I_patch, D_in_patch, D_light_patch, C_patch)
+    if I_patch is None:
+        return D_light, D_light, C_init
+    heavy_out = heavy(I_patch, D_in_patch, D_light_patch, C_patch)
     update_mask = compute_update_mask(M_patch, C_patch)
-    res_patch = delta_raw * update_mask
-    res_full = scatter_residual(res_patch, tiles, B=I.shape[0], H=I.shape[2], W=I.shape[3])
+    delta_raw = heavy_out[:, 0:1, :, :]
+    gate_logit = heavy_out[:, 1:2, :, :]
+    delta_val = 2.0 * torch.tanh(delta_raw)
+    sigma = torch.sigmoid(gate_logit)
+    res_patch = update_mask * (sigma * delta_val)
+    res_full = scatter_residual(res_patch, tiles, B=I.shape[0], H=I.shape[2], W=I.shape[3], stride=STRIDE)
     D_final = D_light + res_full
     return D_final, D_light, C_init
 

@@ -17,7 +17,8 @@ try:
 except Exception:
     profile = None
 
-LOW_CONF_THRESH = 0.3
+SAFE_THRESH = 0.6
+BUFFER = 0.1
 
 def count_params(model):
     return sum(p.numel() for p in model.parameters())
@@ -79,9 +80,9 @@ def scatter_residual(res_patch, tiles, B, H=192, W=288):
     return res_full
 
 
-def compute_update_mask(M_patch, C_patch, thresh=LOW_CONF_THRESH):
-    low_confidence_area = (C_patch < thresh).float()
-    return torch.max(M_patch, low_confidence_area)
+def compute_update_mask(mask_hole, conf, safe_thresh=SAFE_THRESH, buffer=BUFFER):
+    soft_edge = torch.clamp((safe_thresh - conf) / buffer, 0.0, 1.0)
+    return torch.max(mask_hole, soft_edge)
 
 
 def forward_heavy(light, heavy, I, D_in, M, args):
@@ -101,9 +102,13 @@ def forward_heavy(light, heavy, I, D_in, M, args):
     I_patch, D_in_patch, D_light_patch, M_patch, C_patch = crop_tile_patches(
         I, D_in, D_light, M, C_init, tiles
     )
-    delta_raw = heavy(I_patch, D_in_patch, D_light_patch, C_patch)
+    heavy_out = heavy(I_patch, D_in_patch, D_light_patch, C_patch)
     update_mask = compute_update_mask(M_patch, C_patch)
-    res_patch = delta_raw * update_mask
+    delta_raw = heavy_out[:, 0:1, :, :]
+    gate_logit = heavy_out[:, 1:2, :, :]
+    delta_val = 2.0 * torch.tanh(delta_raw)
+    sigma = torch.sigmoid(gate_logit)
+    res_patch = update_mask * (sigma * delta_val)
     res_full = scatter_residual(res_patch, tiles, B=I.shape[0], H=I.shape[2], W=I.shape[3])
     D_final = D_light + res_full
     return D_final, D_light, C_init

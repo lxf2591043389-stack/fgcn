@@ -15,20 +15,21 @@ from models.heavy_refiner import HeavyRefineHead
 from models.scheduler import tile_scheduler
 from losses import charbonnier, build_C_gt, bce_loss, edge_aware_smoothness
 
-LOW_CONF_THRESH = 0.3
-SMOOTH_WEIGHT = 0.1
-FINAL_WEIGHT = 0.8
+SAFE_THRESH = 0.6
+BUFFER = 0.1
+GLOBAL_LOSS_WEIGHT = 0.1
+SMOOTH_WEIGHT = 0.05
 RUN_CONFIG_PATH = "run_config.json"
 
 DEFAULTS = {
     "data_root": "",
     "project_root": "experiments",
-    "datasets": "tofdc",
+    "datasets": "diml",
     "dataset_cfg": "dataset_config.json",
-    "batch_size_train": 8,
-    "batch_size_eval": 1,
-    "batch_size_train_a": 8,
-    "batch_size_eval_a": 1,
+    "batch_size_train": 64,
+    "batch_size_eval": 96,
+    "batch_size_train_a": 64,
+    "batch_size_eval_a": 8,
     "batch_size_train_b": 2,
     "batch_size_eval_b": 1,
     "batch_size_train_c": 2,
@@ -37,7 +38,7 @@ DEFAULTS = {
     "mask_is_valid": False,
     "stage": "all",
     "epochs_a": 40,
-    "epochs_b": 50,
+    "epochs_b": 60,
     "epochs_c": 50,
     "k_max": 32,
     "tau_miss": 0.01,
@@ -51,7 +52,7 @@ DEFAULTS = {
     "gamma": 2.0,
     "s0": 6.0,
     "delta_max": 0.30,
-    "lr_light_a": 3e-4,
+    "lr_light_a": 1e-3,
     "lr_heavy_b": 1e-4,
     "lr_heavy_c": 1e-5,
     "lr_light_c": 1e-6,
@@ -69,8 +70,6 @@ merge_defaults(DEFAULTS, _cfg, ["common", "train", "scheduler", "loss"])
 
 if "smooth_weight" in DEFAULTS:
     SMOOTH_WEIGHT = DEFAULTS["smooth_weight"]
-if "final_weight" in DEFAULTS:
-    FINAL_WEIGHT = DEFAULTS["final_weight"]
 
 def crop_tile_patches(I, D_in, D_light, M, C_init, tiles):
     """
@@ -142,9 +141,9 @@ def scatter_residual(res_patch, tiles, B, H=192, W=288):
     return res_full
 
 
-def compute_update_mask(M_patch, C_patch, thresh=LOW_CONF_THRESH):
-    low_confidence_area = (C_patch < thresh).float()
-    return torch.max(M_patch, low_confidence_area)
+def compute_update_mask(mask_hole, conf, safe_thresh=SAFE_THRESH, buffer=BUFFER):
+    soft_edge = torch.clamp((safe_thresh - conf) / buffer, 0.0, 1.0)
+    return torch.max(mask_hole, soft_edge)
 
 
 def build_tile_mask(tiles, B, H=192, W=288):
@@ -177,6 +176,13 @@ def set_light_depth_decoder_trainable(light):
             p.requires_grad = True
 
 
+def set_light_decoder_mode(light, train):
+    if light is None:
+        return
+    for module in [light.up2_reduce, light.up1_reduce, light.out_d]:
+        module.train(train)
+
+
 def load_checkpoint(model, path, device):
     if not path:
         return False
@@ -185,6 +191,20 @@ def load_checkpoint(model, path, device):
     state = torch.load(path, map_location=device)
     model.load_state_dict(state, strict=True)
     return True
+
+
+def apply_cfg_overrides(args, cfg):
+    if not isinstance(cfg, dict):
+        return args
+    merged = {}
+    for section in ["common", "train", "scheduler", "loss"]:
+        values = cfg.get(section, {})
+        if isinstance(values, dict):
+            merged.update(values)
+    for key, value in merged.items():
+        if hasattr(args, key):
+            setattr(args, key, value)
+    return args
 
 
 def forward_heavy(light, heavy, I, D_in, M, args, grad_light):
@@ -206,12 +226,16 @@ def forward_heavy(light, heavy, I, D_in, M, args, grad_light):
     I_patch, D_in_patch, D_light_patch, M_patch, C_patch = crop_tile_patches(
         I, D_in, D_light, M, C_init, tiles
     )
-    delta_raw = heavy(I_patch, D_in_patch, D_light_patch, C_patch)
+    heavy_out = heavy(I_patch, D_in_patch, D_light_patch, C_patch)
     update_mask = compute_update_mask(M_patch, C_patch)
-    res_patch = delta_raw * update_mask
+    delta_raw = heavy_out[:, 0:1, :, :]
+    gate_logit = heavy_out[:, 1:2, :, :]
+    delta_val = 2.0 * torch.tanh(delta_raw)
+    sigma = torch.sigmoid(gate_logit)
+    res_patch = update_mask * (sigma * delta_val)
     res_full = scatter_residual(res_patch, tiles, B=I.shape[0], H=I.shape[2], W=I.shape[3])
     update_mask_full = scatter_residual(update_mask, tiles, B=I.shape[0], H=I.shape[2], W=I.shape[3])
-    update_mask_full = (update_mask_full > 0).float()
+    update_mask_full = torch.clamp(update_mask_full, 0.0, 1.0)
     D_final = D_light + res_full
     return D_final, D_light, C_init, update_mask_full
 
@@ -227,6 +251,7 @@ def run_epoch(stage, loader, light, heavy, optimizer, args, device, train=True):
             heavy.train(train)
     else:
         light.eval()
+        set_light_decoder_mode(light, train)
         if heavy is not None:
             heavy.train(train)
 
@@ -261,26 +286,17 @@ def run_epoch(stage, loader, light, heavy, optimizer, args, device, train=True):
                 output = D_light
             elif stage == "B":
                 D_final, _, _, update_mask_full = forward_heavy(light, heavy, I, D_in, M, args, grad_light=False)
-                loss_mask = gt_valid * update_mask_full
-                L_main = charbonnier(D_final, D_gt, mask=loss_mask)
-                L_smooth = edge_aware_smoothness(D_final, I, mask=update_mask_full)
-                loss = L_main + SMOOTH_WEIGHT * L_smooth
+                loss_focus = charbonnier(D_final, D_gt, mask=update_mask_full * gt_valid)
+                loss_global = charbonnier(D_final, D_gt, mask=gt_valid)
+                loss_smooth = edge_aware_smoothness(D_final, I)
+                loss = loss_focus + GLOBAL_LOSS_WEIGHT * loss_global + SMOOTH_WEIGHT * loss_smooth
                 output = D_final
             else:
                 D_final, D_light, C_init, update_mask_full = forward_heavy(light, heavy, I, D_in, M, args, grad_light=True)
-                loss_mask = gt_valid * update_mask_full
-                L_final = charbonnier(D_final, D_gt, mask=loss_mask)
-                L_smooth = edge_aware_smoothness(D_final, I, mask=update_mask_full)
-                L_light = charbonnier(D_light, D_gt, mask=gt_valid)
-                C_gt_full = build_C_gt(D_in, D_gt, M, tau_c=args.tau_c)
-                C_gt_1_4 = F.avg_pool2d(C_gt_full, kernel_size=4, stride=4)
-                L_conf = bce_loss(C_init, C_gt_1_4)
-                loss = (
-                    FINAL_WEIGHT * L_final
-                    + args.eta_c * L_light
-                    + args.lambda_c_c * L_conf
-                    + SMOOTH_WEIGHT * L_smooth
-                )
+                loss_focus = charbonnier(D_final, D_gt, mask=update_mask_full * gt_valid)
+                loss_global = charbonnier(D_final, D_gt, mask=gt_valid)
+                loss_smooth = edge_aware_smoothness(D_final, I)
+                loss = loss_focus + GLOBAL_LOSS_WEIGHT * loss_global + SMOOTH_WEIGHT * loss_smooth
                 output = D_final
 
         if train:
@@ -423,6 +439,7 @@ def main():
     parser.add_argument("--heavy_ckpt", default=DEFAULTS["heavy_ckpt"], type=str)
 
     args = parser.parse_args()
+    apply_cfg_overrides(args, _cfg)
 
     save_dir = os.path.join(args.project_root, f"result_{args.datasets}")
     utils.log_file_folder_make_lr(save_dir)
