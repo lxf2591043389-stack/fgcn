@@ -13,12 +13,13 @@ import utils
 from models.light_proxy_net import GlobalProxyNet
 from models.heavy_refiner import HeavyRefineHead
 from models.scheduler import tile_scheduler
-from losses import charbonnier, build_C_gt, bce_loss, edge_aware_smoothness
+from losses import charbonnier, build_C_gt, bce_loss, edge_aware_smoothness, edge_grad_loss
 
 SAFE_THRESH = 0.6
 BUFFER = 0.1
 GLOBAL_LOSS_WEIGHT = 0.1
 SMOOTH_WEIGHT = 0.05
+EDGE_GRAD_WEIGHT = 0.02
 RUN_CONFIG_PATH = "run_config.json"
 
 DEFAULTS = {
@@ -52,6 +53,7 @@ DEFAULTS = {
     "gamma": 2.0,
     "s0": 6.0,
     "delta_max": 0.30,
+    "edge_grad_weight": EDGE_GRAD_WEIGHT,
     "lr_light_a": 1e-3,
     "lr_heavy_b": 1e-4,
     "lr_heavy_c": 1e-5,
@@ -70,6 +72,8 @@ merge_defaults(DEFAULTS, _cfg, ["common", "train", "scheduler", "loss"])
 
 if "smooth_weight" in DEFAULTS:
     SMOOTH_WEIGHT = DEFAULTS["smooth_weight"]
+if "edge_grad_weight" in DEFAULTS:
+    EDGE_GRAD_WEIGHT = DEFAULTS["edge_grad_weight"]
 
 def crop_tile_patches(I, D_in, D_light, M, C_init, tiles):
     """
@@ -296,7 +300,13 @@ def run_epoch(stage, loader, light, heavy, optimizer, args, device, train=True):
                 loss_focus = charbonnier(D_final, D_gt, mask=update_mask_full * gt_valid)
                 loss_global = charbonnier(D_final, D_gt, mask=gt_valid)
                 loss_smooth = edge_aware_smoothness(D_final, I)
-                loss = loss_focus + GLOBAL_LOSS_WEIGHT * loss_global + SMOOTH_WEIGHT * loss_smooth
+                loss_edge = edge_grad_loss(D_final, D_gt)
+                loss = (
+                    loss_focus
+                    + GLOBAL_LOSS_WEIGHT * loss_global
+                    + SMOOTH_WEIGHT * loss_smooth
+                    + EDGE_GRAD_WEIGHT * loss_edge
+                )
                 output = D_final
 
         if train:

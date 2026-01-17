@@ -52,3 +52,30 @@ def edge_aware_smoothness(depth, image, mask=None):
         if count > 0:
             return loss / count
     return smooth_x.mean() + smooth_y.mean()
+
+
+def edge_grad_loss(pred, target, mask=None):
+    pred_dx = pred[:, :, :, 1:] - pred[:, :, :, :-1]
+    pred_dy = pred[:, :, 1:, :] - pred[:, :, :-1, :]
+    target_dx = target[:, :, :, 1:] - target[:, :, :, :-1]
+    target_dy = target[:, :, 1:, :] - target[:, :, :-1, :]
+    diff_x = torch.abs(pred_dx - target_dx)
+    diff_y = torch.abs(pred_dy - target_dy)
+
+    if mask is not None:
+        mask_x = mask[:, :, :, 1:] * mask[:, :, :, :-1]
+        mask_y = mask[:, :, 1:, :] * mask[:, :, :-1, :]
+        loss = 0.0
+        count = 0
+        valid_x = mask_x > 0
+        if valid_x.any():
+            loss += diff_x[valid_x].mean()
+            count += 1
+        valid_y = mask_y > 0
+        if valid_y.any():
+            loss += diff_y[valid_y].mean()
+            count += 1
+        if count > 0:
+            return loss / count
+
+    return diff_x.mean() + diff_y.mean()
