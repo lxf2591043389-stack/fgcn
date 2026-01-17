@@ -61,6 +61,7 @@
   },
   "loss": {
     "smooth_weight": 0.1,
+    "edge_grad_weight": 0.02,
     "final_weight": 0.8
   }
 }
