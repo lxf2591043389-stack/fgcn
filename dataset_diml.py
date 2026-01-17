@@ -35,7 +35,7 @@ class DIML_Dataset(Dataset):
                 if len(parts) != 3:
                     continue
                 self.samples.append(
-                    {"rgb": parts[0], "depth": parts[1], "gt": parts[2]}
+                    {"rgb": parts[0], "depth": parts[2], "gt": parts[1]}
                 )
 
         print(f"[{split}] total samples: {len(self.samples)}")
@@ -54,12 +54,22 @@ class DIML_Dataset(Dataset):
             [transforms.Resize(self.target_size, interpolation=transforms.InterpolationMode.NEAREST)]
         )
 
+    def _resolve_path(self, path_value):
+        path_value = os.path.normpath(path_value)
+        if not os.path.isabs(path_value):
+            return os.path.normpath(os.path.join(self.root, path_value))
+        if os.path.exists(path_value):
+            return path_value
+        drive, tail = os.path.splitdrive(path_value)
+        tail = tail.lstrip("\\/")
+        return os.path.normpath(os.path.join(self.root, tail))
+
     def __getitem__(self, index):
         item = self.samples[index]
 
-        rgb_path = os.path.normpath(os.path.join(self.root, item["rgb"]))
-        depth_path = os.path.normpath(os.path.join(self.root, item["depth"]))
-        gt_path = os.path.normpath(os.path.join(self.root, item["gt"]))
+        rgb_path = self._resolve_path(item["rgb"])
+        depth_path = self._resolve_path(item["depth"])
+        gt_path = self._resolve_path(item["gt"])
 
         rgb_pil = Image.open(rgb_path).convert("RGB")
         rgb = self.rgb_transform(rgb_pil)
