@@ -51,19 +51,41 @@ class RealToF_Dataset(Dataset):
     def _rgb_to_tensor(self, rgb_np):
         if rgb_np.ndim == 2:
             rgb_np = np.stack([rgb_np] * 3, axis=-1)
-        if rgb_np.shape[-1] != 3:
+        if rgb_np.ndim != 3:
+            raise ValueError(f"RGB array must be 2D or 3D, got {rgb_np.shape}")
+        if rgb_np.shape[-1] == 3:
+            rgb = torch.from_numpy(rgb_np.astype(np.float32)).permute(2, 0, 1)
+        elif rgb_np.shape[0] == 3:
+            rgb = torch.from_numpy(rgb_np.astype(np.float32))
+        else:
             raise ValueError(f"RGB array must have 3 channels, got {rgb_np.shape}")
-        rgb = torch.from_numpy(rgb_np.astype(np.float32)).permute(2, 0, 1)
         if rgb.max() > 1.0:
             scale = 65535.0 if rgb.max() > 255.0 else 255.0
             rgb = rgb / scale
         return rgb
 
+    def _to_single_channel(self, arr, path):
+        if arr.ndim == 2:
+            arr = arr[None, ...]
+        elif arr.ndim == 3:
+            if arr.shape[0] == 1:
+                pass
+            elif arr.shape[-1] == 1:
+                arr = np.transpose(arr, (2, 0, 1))
+            else:
+                raise ValueError(f"Depth array must be single-channel, got {arr.shape} at {path}")
+        else:
+            raise ValueError(f"Depth array must be 2D or 3D, got {arr.shape} at {path}")
+        return arr
+
     def _resize_tensor(self, tensor, mode="bilinear"):
         tensor = tensor.unsqueeze(0)
-        resized = F.interpolate(
-            tensor, size=self.target_size, mode=mode, align_corners=False
-        )
+        if mode in {"linear", "bilinear", "bicubic", "trilinear"}:
+            resized = F.interpolate(
+                tensor, size=self.target_size, mode=mode, align_corners=False
+            )
+        else:
+            resized = F.interpolate(tensor, size=self.target_size, mode=mode)
         return resized.squeeze(0)
 
     def __getitem__(self, index):
@@ -78,13 +100,8 @@ class RealToF_Dataset(Dataset):
         depth_np = self._load_npy(depth_path)
 
         rgb = self._rgb_to_tensor(rgb_np)
-        gt = torch.from_numpy(gt_np.astype(np.float32))
-        depth = torch.from_numpy(depth_np.astype(np.float32))
-
-        if gt.ndim == 2:
-            gt = gt.unsqueeze(0)
-        if depth.ndim == 2:
-            depth = depth.unsqueeze(0)
+        gt = torch.from_numpy(self._to_single_channel(gt_np, gt_path).astype(np.float32))
+        depth = torch.from_numpy(self._to_single_channel(depth_np, depth_path).astype(np.float32))
 
         rgb = self._resize_tensor(rgb, mode="bilinear")
         gt = self._resize_tensor(gt, mode="nearest")
