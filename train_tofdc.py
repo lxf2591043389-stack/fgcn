@@ -13,13 +13,12 @@ import utils
 from models.light_proxy_net import GlobalProxyNet
 from models.heavy_refiner import HeavyRefineHead
 from models.scheduler import tile_scheduler
-from losses import charbonnier, build_C_gt, bce_loss, edge_aware_smoothness, edge_grad_loss
+from losses import charbonnier, build_C_gt, bce_loss, edge_aware_smoothness
 
 SAFE_THRESH = 0.6
 BUFFER = 0.1
 GLOBAL_LOSS_WEIGHT = 0.1
 SMOOTH_WEIGHT = 0.05
-EDGE_GRAD_WEIGHT = 0.02
 RUN_CONFIG_PATH = "run_config.json"
 
 DEFAULTS = {
@@ -53,7 +52,6 @@ DEFAULTS = {
     "gamma": 2.0,
     "s0": 6.0,
     "delta_max": 0.30,
-    "edge_grad_weight": EDGE_GRAD_WEIGHT,
     "lr_light_a": 1e-3,
     "lr_heavy_b": 1e-4,
     "lr_heavy_c": 1e-5,
@@ -72,8 +70,6 @@ merge_defaults(DEFAULTS, _cfg, ["common", "train", "scheduler", "loss"])
 
 if "smooth_weight" in DEFAULTS:
     SMOOTH_WEIGHT = DEFAULTS["smooth_weight"]
-if "edge_grad_weight" in DEFAULTS:
-    EDGE_GRAD_WEIGHT = DEFAULTS["edge_grad_weight"]
 
 def crop_tile_patches(I, D_in, D_light, M, C_init, tiles):
     """
@@ -254,10 +250,7 @@ def run_epoch(stage, loader, light, heavy, optimizer, args, device, train=True):
         if heavy is not None:
             heavy.train(train)
     else:
-        light.eval()
-        set_light_decoder_mode(light, train)
-        if heavy is not None:
-            heavy.train(train)
+        raise ValueError(f"Unsupported stage: {stage}")
 
     total_loss = 0.0
     total_step = 0
@@ -296,18 +289,7 @@ def run_epoch(stage, loader, light, heavy, optimizer, args, device, train=True):
                 loss = loss_focus + GLOBAL_LOSS_WEIGHT * loss_global + SMOOTH_WEIGHT * loss_smooth
                 output = D_final
             else:
-                D_final, D_light, C_init, update_mask_full = forward_heavy(light, heavy, I, D_in, M, args, grad_light=True)
-                loss_focus = charbonnier(D_final, D_gt, mask=update_mask_full * gt_valid)
-                loss_global = charbonnier(D_final, D_gt, mask=gt_valid)
-                loss_smooth = edge_aware_smoothness(D_final, I)
-                loss_edge = edge_grad_loss(D_final, D_gt)
-                loss = (
-                    loss_focus
-                    + GLOBAL_LOSS_WEIGHT * loss_global
-                    + SMOOTH_WEIGHT * loss_smooth
-                    + EDGE_GRAD_WEIGHT * loss_edge
-                )
-                output = D_final
+                raise ValueError(f"Unsupported stage: {stage}")
 
         if train:
             loss.backward()
@@ -316,8 +298,7 @@ def run_epoch(stage, loader, light, heavy, optimizer, args, device, train=True):
             elif stage == "B":
                 torch.nn.utils.clip_grad_norm_(heavy.parameters(), args.grad_clip)
             else:
-                params = list(light.parameters()) + list(heavy.parameters())
-                torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
+                raise ValueError(f"Unsupported stage: {stage}")
             optimizer.step()
 
         batch_size = I.shape[0]
@@ -354,18 +335,7 @@ def train_stage(stage, light, heavy, train_loader, eval_loader, args, device, sa
             optimizer, T_max=epochs, eta_min=1e-6
         )
     else:
-        optimizer = torch.optim.AdamW(
-            [
-                {"params": heavy.parameters(), "lr": args.lr_heavy_c},
-                {"params": light.parameters(), "lr": args.lr_light_c},
-            ],
-            weight_decay=args.weight_decay,
-        )
-        epochs = args.epochs_c
-        ckpt_path = os.path.join(save_dir, "heavy_best_c.pth")
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=epochs, eta_min=1e-7
-        )
+        raise ValueError(f"Unsupported stage: {stage}")
 
     for epoch in range(1, epochs + 1):
         train_loss, train_error = run_epoch(stage, train_loader, light, heavy, optimizer, args, device, train=True)
@@ -381,10 +351,7 @@ def train_stage(stage, light, heavy, train_loader, eval_loader, args, device, sa
                 torch.save(heavy.state_dict(), ckpt_path)
                 torch.save(heavy.state_dict(), os.path.join(save_dir, "heavy_best.pth"))
             else:
-                torch.save(heavy.state_dict(), ckpt_path)
-                torch.save(heavy.state_dict(), os.path.join(save_dir, "heavy_best.pth"))
-                torch.save(light.state_dict(), os.path.join(save_dir, "light_best_c.pth"))
-                torch.save(light.state_dict(), os.path.join(save_dir, "light_best.pth"))
+                raise ValueError(f"Unsupported stage: {stage}")
 
         lr_log = optimizer.param_groups[0]["lr"]
         utils.log_result_lr(save_dir, train_error, epoch, lr_log, False, "train")
@@ -417,7 +384,7 @@ def main():
     parser.add_argument("--num_workers", default=DEFAULTS["num_workers"], type=int)
     parser.add_argument("--mask_is_valid", action="store_true", default=DEFAULTS["mask_is_valid"])
 
-    parser.add_argument("--stage", default=DEFAULTS["stage"], choices=["A", "B", "C", "all"])
+    parser.add_argument("--stage", default=DEFAULTS["stage"], choices=["A", "B", "all"])
     parser.add_argument("--epochs_a", default=DEFAULTS["epochs_a"], type=int)
     parser.add_argument("--epochs_b", default=DEFAULTS["epochs_b"], type=int)
     parser.add_argument("--epochs_c", default=DEFAULTS["epochs_c"], type=int)
@@ -510,36 +477,7 @@ def main():
         train_loader, eval_loader = make_loaders(args.batch_size_train_b, args.batch_size_eval_b)
         train_stage("B", light, heavy, train_loader, eval_loader, args, device, save_dir, run_id)
 
-    if args.stage in ["C", "all"]:
-        set_light_depth_decoder_trainable(light)
-
-        light_ckpt = args.light_ckpt
-        if not light_ckpt:
-            light_ckpt = os.path.join(save_dir, "light_best_a.pth")
-            if not os.path.isfile(light_ckpt):
-                light_ckpt = os.path.join(save_dir, "light_best.pth")
-        if not load_checkpoint(light, light_ckpt, device):
-            raise FileNotFoundError(f"Light checkpoint not found: {light_ckpt}")
-
-        if heavy is None:
-            heavy = HeavyRefineHead(
-                alpha=args.alpha,
-                beta=args.beta,
-                gamma=args.gamma,
-                theta_l=args.theta_l,
-                theta_h=args.theta_h,
-                s0=args.s0,
-            ).to(device)
-
-        heavy_ckpt = args.heavy_ckpt
-        if not heavy_ckpt:
-            heavy_ckpt = os.path.join(save_dir, "heavy_best_b.pth")
-            if not os.path.isfile(heavy_ckpt):
-                heavy_ckpt = os.path.join(save_dir, "heavy_best.pth")
-        if not load_checkpoint(heavy, heavy_ckpt, device):
-            raise FileNotFoundError(f"Heavy checkpoint not found: {heavy_ckpt}")
-        train_loader, eval_loader = make_loaders(args.batch_size_train_c, args.batch_size_eval_c)
-        train_stage("C", light, heavy, train_loader, eval_loader, args, device, save_dir, run_id)
+    # Stage C is disabled; use Stage A + B as the final model.
 
 
 if __name__ == "__main__":

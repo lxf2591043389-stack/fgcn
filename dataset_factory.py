@@ -12,6 +12,16 @@ def _resolve_config_path(path):
     return os.path.join(base_dir, path)
 
 
+def _resolve_dataset_root(root, config_path):
+    if not root:
+        return root
+    if os.path.isabs(root):
+        return root
+    config_path = _resolve_config_path(config_path)
+    base_dir = os.path.dirname(config_path)
+    return os.path.normpath(os.path.join(base_dir, root))
+
+
 def load_dataset_config(path):
     config_path = _resolve_config_path(path)
     with open(config_path, "r", encoding="utf-8") as f:
@@ -31,6 +41,7 @@ def resolve_dataset_root(name, config_path, override_root=None):
         raise ValueError(f"Unknown dataset: {dataset_name}")
     ds_cfg = cfg["datasets"][dataset_name]
     root = override_root if override_root else ds_cfg.get("root")
+    root = _resolve_dataset_root(root, config_path)
     if not root:
         raise ValueError(f"Dataset root missing for: {dataset_name}")
     return root
@@ -43,6 +54,7 @@ def build_dataset(name, split, config_path, override_root=None):
         raise ValueError(f"Unknown dataset: {dataset_name}")
     ds_cfg = cfg["datasets"][dataset_name]
     root = override_root if override_root else ds_cfg.get("root")
+    root = _resolve_dataset_root(root, config_path)
     if not root:
         raise ValueError(f"Dataset root missing for: {dataset_name}")
 
