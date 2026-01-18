@@ -1,5 +1,5 @@
 {
-  "default": "tofdc",
+  "default": "diml",
   "datasets": {
     "tofdc": {
       "type": "tofdc",
@@ -8,7 +8,12 @@
     },
     "diml": {
       "type": "diml",
-      "root": "diml",
+      "root": "C:\\\\kinect\\\\aaa_depth_inpainting\\\\diml\\\\diml",
+      "depth_scale": 1000.0
+    },
+    "realtof": {
+      "type": "realtof",
+      "root": "C:\\\\kinect\\\\aaa_depth_inpainting\\\\realtof\\\\RealToFDataset_modify",
       "depth_scale": 1000.0
     }
   }

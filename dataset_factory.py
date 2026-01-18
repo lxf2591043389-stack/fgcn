@@ -3,6 +3,7 @@ import os
 
 from datasets_tofdc import TOFDC_Dataset
 from dataset_diml import DIML_Dataset
+from dataset_realtof import RealToF_Dataset
 
 
 def _resolve_config_path(path):
@@ -63,5 +64,8 @@ def build_dataset(name, split, config_path, override_root=None):
     if ds_cfg["type"] == "diml":
         depth_scale = ds_cfg.get("depth_scale", 1000.0)
         return DIML_Dataset(root=root, split=split, depth_scale=depth_scale)
+    if ds_cfg["type"] == "realtof":
+        depth_scale = ds_cfg.get("depth_scale", 1000.0)
+        return RealToF_Dataset(root=root, split=split, depth_scale=depth_scale)
 
     raise ValueError(f"Unsupported dataset type: {ds_cfg['type']}")
