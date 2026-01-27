@@ -13,61 +13,77 @@ from dataset_factory import build_dataset, load_dataset_config, resolve_dataset_
 import utils
 from models.light_proxy_net import GlobalProxyNet
 from models.heavy_refiner import HeavyRefineHead
-from models.tiny_fusion_head import TinyFusionHead
 from test_tofdc_config import RUN_CONFIG_PATH, add_base_args, add_heavy_args, add_scheduler_args
 
-SAFE_THRESH = 0.6
-BUFFER = 0.1
 PATCH_SIZE = 32
-CONTEXT = 48
-PAD_CTX = 8
 STRIDE = 32
+DELTA_SCALE = 1.0
 
 
-def build_w_global(mask):
-    w = mask.clone()
-    prev = mask
-    for r, weight in [(2, 0.7), (4, 0.4), (8, 0.2)]:
-        dil = F.max_pool2d(prev, kernel_size=2 * r + 1, stride=1, padding=r)
-        ring = torch.clamp(dil - prev, 0.0, 1.0)
-        w = w + weight * ring
-        prev = dil
-    return torch.clamp(w, 0.0, 1.0)
+def scatter_patch_to_full(D_patch, tiles, B, H, W, stride, D_light_fallback):
+    ksz = tiles.shape[1]
+    full = D_patch.new_zeros((B, 1, H, W))
+    count = D_patch.new_zeros((B, 1, H, W))
+    D_patch = D_patch.view(B, ksz, 1, PATCH_SIZE, PATCH_SIZE)
+    tiles_list = tiles.detach().cpu().tolist()
+
+    for b in range(B):
+        for k in range(ksz):
+            i, j = tiles_list[b][k]
+            y0 = int(i) * stride
+            x0 = int(j) * stride
+            full[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE] += D_patch[b, k]
+            count[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE] += 1.0
+
+    out = full / torch.clamp(count, min=1.0)
+    out = torch.where(count > 0, out, D_light_fallback)
+    return out, count
 
 
-def forward_v2(light, heavy, fusion, I, D_in, M):
+def forward_v2(light, heavy, I, D_in, M, D_max):
     D_light, C_init = light(I, D_in, M)
     H, W = I.shape[2], I.shape[3]
+    D_light = torch.clamp(D_light, 0.0, D_max)
     C_full = F.interpolate(C_init, size=(H, W), mode="bilinear", align_corners=False)
+
     pooled = F.max_pool2d(M, kernel_size=PATCH_SIZE, stride=STRIDE)
     tiles = (pooled > 0).nonzero(as_tuple=False)
     if tiles.numel() == 0:
         return D_light, D_light, C_full
 
-    I_pad = F.pad(I, (PAD_CTX, PAD_CTX, PAD_CTX, PAD_CTX), mode="replicate")
-    D_in_pad = F.pad(D_in, (PAD_CTX, PAD_CTX, PAD_CTX, PAD_CTX), mode="replicate")
-    D_light_pad = F.pad(D_light, (PAD_CTX, PAD_CTX, PAD_CTX, PAD_CTX), mode="replicate")
-    C_pad = F.pad(C_full, (PAD_CTX, PAD_CTX, PAD_CTX, PAD_CTX), mode="replicate")
-    M_pad = F.pad(M, (PAD_CTX, PAD_CTX, PAD_CTX, PAD_CTX), mode="replicate")
+    B = I.shape[0]
+    tiles_list = tiles.detach().cpu().tolist()
+    tiles_by_b = [[] for _ in range(B)]
+    for t in tiles_list:
+        b, i, j = int(t[0]), int(t[2]), int(t[3])
+        tiles_by_b[b].append((i, j))
+    max_k = max((len(v) for v in tiles_by_b), default=0)
+    if max_k == 0:
+        return D_light, D_light, C_full
+
+    tiles_tensor = torch.zeros((B, max_k, 2), dtype=torch.long, device=I.device)
+    for b in range(B):
+        tlist = tiles_by_b[b]
+        if not tlist:
+            tlist = [(0, 0)]
+        if len(tlist) < max_k:
+            tlist = tlist + [tlist[-1]] * (max_k - len(tlist))
+        tiles_tensor[b] = torch.tensor(tlist, dtype=torch.long, device=I.device)
 
     I_patches = []
     D_in_patches = []
     D_light_patches = []
     C_patches = []
     M_patches = []
-    coords = []
-    for t in tiles:
-        b = int(t[0])
-        i = int(t[2])
-        j = int(t[3])
-        y0 = i * STRIDE
-        x0 = j * STRIDE
-        I_patches.append(I_pad[b:b + 1, :, y0:y0 + CONTEXT, x0:x0 + CONTEXT])
-        D_in_patches.append(D_in_pad[b:b + 1, :, y0:y0 + CONTEXT, x0:x0 + CONTEXT])
-        D_light_patches.append(D_light_pad[b:b + 1, :, y0:y0 + CONTEXT, x0:x0 + CONTEXT])
-        C_patches.append(C_pad[b:b + 1, :, y0:y0 + CONTEXT, x0:x0 + CONTEXT])
-        M_patches.append(M_pad[b:b + 1, :, y0:y0 + CONTEXT, x0:x0 + CONTEXT])
-        coords.append((b, y0, x0))
+    for b in range(B):
+        for i, j in tiles_by_b[b]:
+            y0 = i * STRIDE
+            x0 = j * STRIDE
+            I_patches.append(I[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE])
+            D_in_patches.append(D_in[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE])
+            D_light_patches.append(D_light[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE])
+            C_patches.append(C_full[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE])
+            M_patches.append(M[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE])
 
     I_ctx = torch.cat(I_patches, dim=0)
     D_in_ctx = torch.cat(D_in_patches, dim=0)
@@ -75,23 +91,16 @@ def forward_v2(light, heavy, fusion, I, D_in, M):
     C_ctx = torch.cat(C_patches, dim=0)
     M_ctx = torch.cat(M_patches, dim=0)
 
-    Dh_ctx = heavy(I_ctx, D_in_ctx, D_light_ctx, C_ctx)
-    Dh_core = Dh_ctx[:, :, PAD_CTX:PAD_CTX + PATCH_SIZE, PAD_CTX:PAD_CTX + PATCH_SIZE]
-    D_light_core = D_light_ctx[:, :, PAD_CTX:PAD_CTX + PATCH_SIZE, PAD_CTX:PAD_CTX + PATCH_SIZE]
-    M_core = M_ctx[:, :, PAD_CTX:PAD_CTX + PATCH_SIZE, PAD_CTX:PAD_CTX + PATCH_SIZE]
-    C_core = C_ctx[:, :, PAD_CTX:PAD_CTX + PATCH_SIZE, PAD_CTX:PAD_CTX + PATCH_SIZE]
+    delta_raw = heavy(I_ctx, D_in_ctx, D_light_ctx, C_ctx)
+    delta = DELTA_SCALE * torch.tanh(delta_raw)
+    Dh = torch.clamp(D_light_ctx + delta, 0.0, D_max)
+    hole_patch = (M_ctx > 0.5).float()
+    D_final_patch = torch.where(hole_patch > 0, Dh, D_light_ctx)
 
-    w_in = torch.cat([D_light_core, Dh_core, M_core, C_core], dim=1)
-    w_core = fusion(w_in)
-    D_core = w_core * Dh_core + (1.0 - w_core) * D_light_core
-
-    D_ref = D_light.clone()
-    for n, (b, y0, x0) in enumerate(coords):
-        D_ref[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE] = D_core[n:n + 1]
-
-    W_global = build_w_global(M)
-    D_final = (1.0 - W_global) * D_light + W_global * D_ref
-    return D_final, D_light, C_full
+    D_final_full, count = scatter_patch_to_full(
+        D_final_patch, tiles_tensor, B=B, H=H, W=W, stride=STRIDE, D_light_fallback=D_light
+    )
+    return D_final_full, D_light, C_full
 
 
 def load_state(model, path, device):
@@ -124,11 +133,10 @@ def resolve_heavy_ckpt(args, result_dir):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TOFDC test C (final refinement)")
+    parser = argparse.ArgumentParser(description="TOFDC test C (V2 hard replace)")
     add_base_args(parser)
     add_heavy_args(parser)
     add_scheduler_args(parser)
-    parser.add_argument("--fusion_ckpt", default="", type=str)
     parser.add_argument("--light_source", default="c", choices=["a", "c"])
     args = parser.parse_args()
 
@@ -141,31 +149,30 @@ def main():
         dataset_name = resolve_dataset_name(args.datasets, dataset_cfg)
         ds_cfg = dataset_cfg.get("datasets", {}).get(dataset_name, {})
         dataset_root = args.data_root if args.data_root else ds_cfg.get("root")
+        args.depth_max_m = float(ds_cfg.get("depth_max_m", 5.0))
     except Exception as exc:
         dataset_cfg = {"error": str(exc)}
+        args.depth_max_m = 5.0
 
     result_dir = os.path.join(args.project_root, f"result_{args.datasets}")
     run_id = time.strftime("%Y%m%d_%H%M%S")
     save_dir = os.path.join(result_dir, f"test_results_c_{run_id}")
     img_save_dir = os.path.join(save_dir, "img")
-    os.makedirs(img_save_dir, exist_ok=True)
+    if args.save_images:
+        os.makedirs(img_save_dir, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     light = GlobalProxyNet().to(device)
     heavy = HeavyRefineHead().to(device)
-    fusion = TinyFusionHead().to(device)
 
     light_ckpt = resolve_light_ckpt(args, result_dir)
     heavy_ckpt = resolve_heavy_ckpt(args, result_dir)
     load_state(light, light_ckpt, device)
     load_state(heavy, heavy_ckpt, device)
-    fusion_ckpt = args.fusion_ckpt or os.path.join(result_dir, "fusion_best_b.pth")
-    load_state(fusion, fusion_ckpt, device)
 
     light.eval()
     heavy.eval()
-    fusion.eval()
 
     dataset = build_dataset(args.datasets, args.split, args.dataset_cfg, args.data_root)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
@@ -192,7 +199,7 @@ def main():
                 torch.cuda.synchronize()
             start = time.time()
 
-            D_pred, _, _ = forward_v2(light, heavy, fusion, I, D_in, M)
+            D_pred, _, _ = forward_v2(light, heavy, I, D_in, M, D_max=args.depth_max_m)
 
             if device.type == "cuda":
                 torch.cuda.synchronize()
@@ -230,7 +237,6 @@ def main():
         f.write("\n=== Checkpoints ===\n")
         f.write(f"light_ckpt: {light_ckpt}\n")
         f.write(f"heavy_ckpt: {heavy_ckpt}\n")
-        f.write(f"fusion_ckpt: {fusion_ckpt}\n")
         f.write("\n=== Args ===\n")
         f.write(json.dumps(vars(args), sort_keys=True, indent=2, ensure_ascii=True))
         f.write("\n")

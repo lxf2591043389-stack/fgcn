@@ -14,7 +14,8 @@
     "realtof": {
       "type": "realtof",
       "root": "C:\\\\kinect\\\\aaa_depth_inpainting\\\\realtof\\\\RealToFDataset_modify",
-      "depth_scale": 1000.0
+      "depth_scale": 1000.0,
+      "depth_max_m": 5.393
     }
   }
 }

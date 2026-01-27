@@ -8,17 +8,18 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from config_utils import load_run_config, merge_defaults
-from dataset_factory import build_dataset, resolve_dataset_root
+from dataset_factory import build_dataset, resolve_dataset_root, load_dataset_config, resolve_dataset_name
 import utils
 from models.light_proxy_net import GlobalProxyNet
 from models.heavy_refiner import HeavyRefineHead
-from models.tiny_fusion_head import TinyFusionHead
-from losses import charbonnier, build_C_gt, bce_loss, edge_aware_smoothness
+from losses import charbonnier, build_C_gt, bce_loss, edge_aware_smoothness, gradient_consistency_loss
 
 SAFE_THRESH = 0.6
 BUFFER = 0.1
 GLOBAL_LOSS_WEIGHT = 0.1
 SMOOTH_WEIGHT = 0.05
+DELTA_SCALE = 1.0
+LAMBDA_GRAD = 0.1
 PATCH_SIZE = 32
 CONTEXT = 48
 PAD_CTX = 8
@@ -67,7 +68,6 @@ DEFAULTS = {
     "grad_clip": 0.5,
     "light_ckpt": "",
     "heavy_ckpt": "",
-    "fusion_ckpt": "",
 }
 
 _cfg = load_run_config(RUN_CONFIG_PATH)
@@ -88,7 +88,8 @@ def build_w_global(mask):
 
 
 def dilate_mask(mask, r):
-    return F.max_pool2d(mask, kernel_size=2 * r + 1, stride=1, padding=r)
+    k = 2 * r + 1
+    return torch.clamp(F.max_pool2d(mask, kernel_size=k, stride=1, padding=r), 0.0, 1.0)
 
 
 def set_requires_grad(model, flag):
@@ -122,7 +123,27 @@ def apply_cfg_overrides(args, cfg):
     return args
 
 
-def forward_v2(light, heavy, fusion, I, D_in, M, grad_light):
+def scatter_patch_to_full(D_patch, tiles, B, H, W, stride, D_light_fallback):
+    ksz = tiles.shape[1]
+    full = D_patch.new_zeros((B, 1, H, W))
+    count = D_patch.new_zeros((B, 1, H, W))
+    D_patch = D_patch.view(B, ksz, 1, PATCH_SIZE, PATCH_SIZE)
+    tiles_list = tiles.detach().cpu().tolist()
+
+    for b in range(B):
+        for k in range(ksz):
+            i, j = tiles_list[b][k]
+            y0 = int(i) * stride
+            x0 = int(j) * stride
+            full[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE] += D_patch[b, k]
+            count[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE] += 1.0
+
+    out = full / torch.clamp(count, min=1.0)
+    out = torch.where(count > 0, out, D_light_fallback)
+    return out, count
+
+
+def forward_v2(light, heavy, I, D_in, M, grad_light, D_max):
     if grad_light:
         D_light, C_init = light(I, D_in, M)
     else:
@@ -130,17 +151,12 @@ def forward_v2(light, heavy, fusion, I, D_in, M, grad_light):
             D_light, C_init = light(I, D_in, M)
 
     H, W = I.shape[2], I.shape[3]
+    D_light = torch.clamp(D_light, 0.0, D_max)
     C_full = F.interpolate(C_init, size=(H, W), mode="bilinear", align_corners=False)
     pooled = F.max_pool2d(M, kernel_size=PATCH_SIZE, stride=STRIDE)
     tiles = (pooled > 0).nonzero(as_tuple=False)
     if tiles.numel() == 0:
-        return D_light, D_light, C_full, None, None
-
-    I_pad = F.pad(I, (PAD_CTX, PAD_CTX, PAD_CTX, PAD_CTX), mode="replicate")
-    D_in_pad = F.pad(D_in, (PAD_CTX, PAD_CTX, PAD_CTX, PAD_CTX), mode="replicate")
-    D_light_pad = F.pad(D_light, (PAD_CTX, PAD_CTX, PAD_CTX, PAD_CTX), mode="replicate")
-    C_pad = F.pad(C_full, (PAD_CTX, PAD_CTX, PAD_CTX, PAD_CTX), mode="replicate")
-    M_pad = F.pad(M, (PAD_CTX, PAD_CTX, PAD_CTX, PAD_CTX), mode="replicate")
+        return D_light, D_light, C_full, None, None, None, None
 
     I_patches = []
     D_in_patches = []
@@ -148,18 +164,35 @@ def forward_v2(light, heavy, fusion, I, D_in, M, grad_light):
     C_patches = []
     M_patches = []
     coords = []
-    for t in tiles:
-        b = int(t[0])
-        i = int(t[2])
-        j = int(t[3])
-        y0 = i * STRIDE
-        x0 = j * STRIDE
-        I_patches.append(I_pad[b:b + 1, :, y0:y0 + CONTEXT, x0:x0 + CONTEXT])
-        D_in_patches.append(D_in_pad[b:b + 1, :, y0:y0 + CONTEXT, x0:x0 + CONTEXT])
-        D_light_patches.append(D_light_pad[b:b + 1, :, y0:y0 + CONTEXT, x0:x0 + CONTEXT])
-        C_patches.append(C_pad[b:b + 1, :, y0:y0 + CONTEXT, x0:x0 + CONTEXT])
-        M_patches.append(M_pad[b:b + 1, :, y0:y0 + CONTEXT, x0:x0 + CONTEXT])
-        coords.append((b, y0, x0))
+    B = I.shape[0]
+    tiles_list = tiles.detach().cpu().tolist()
+    tiles_by_b = [[] for _ in range(B)]
+    for t in tiles_list:
+        b, i, j = int(t[0]), int(t[2]), int(t[3])
+        tiles_by_b[b].append((i, j))
+    max_k = max((len(v) for v in tiles_by_b), default=0)
+    if max_k == 0:
+        return D_light, D_light, C_full, None, None, None, None
+
+    tiles_tensor = torch.zeros((B, max_k, 2), dtype=torch.long, device=I.device)
+    for b in range(B):
+        tlist = tiles_by_b[b]
+        if not tlist:
+            tlist = [(0, 0)]
+        if len(tlist) < max_k:
+            tlist = tlist + [tlist[-1]] * (max_k - len(tlist))
+        tiles_tensor[b] = torch.tensor(tlist, dtype=torch.long, device=I.device)
+
+    for b in range(B):
+        for i, j in tiles_by_b[b]:
+            y0 = i * STRIDE
+            x0 = j * STRIDE
+            I_patches.append(I[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE])
+            D_in_patches.append(D_in[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE])
+            D_light_patches.append(D_light[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE])
+            C_patches.append(C_full[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE])
+            M_patches.append(M[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE])
+            coords.append((b, y0, x0))
 
     I_ctx = torch.cat(I_patches, dim=0)
     D_in_ctx = torch.cat(D_in_patches, dim=0)
@@ -167,38 +200,29 @@ def forward_v2(light, heavy, fusion, I, D_in, M, grad_light):
     C_ctx = torch.cat(C_patches, dim=0)
     M_ctx = torch.cat(M_patches, dim=0)
 
-    Dh_ctx = heavy(I_ctx, D_in_ctx, D_light_ctx, C_ctx)
-    Dh_core = Dh_ctx[:, :, PAD_CTX:PAD_CTX + PATCH_SIZE, PAD_CTX:PAD_CTX + PATCH_SIZE]
-    D_light_core = D_light_ctx[:, :, PAD_CTX:PAD_CTX + PATCH_SIZE, PAD_CTX:PAD_CTX + PATCH_SIZE]
-    M_core = M_ctx[:, :, PAD_CTX:PAD_CTX + PATCH_SIZE, PAD_CTX:PAD_CTX + PATCH_SIZE]
-    C_core = C_ctx[:, :, PAD_CTX:PAD_CTX + PATCH_SIZE, PAD_CTX:PAD_CTX + PATCH_SIZE]
+    delta_raw = heavy(I_ctx, D_in_ctx, D_light_ctx, C_ctx)
+    delta = DELTA_SCALE * torch.tanh(delta_raw)
+    Dh = torch.clamp(D_light_ctx + delta, 0.0, D_max)
+    hole_patch = (M_ctx > 0.5).float()
+    D_final_patch = torch.where(hole_patch > 0, Dh, D_light_ctx)
 
-    w_in = torch.cat([D_light_core, Dh_core, M_core, C_core], dim=1)
-    w_core = fusion(w_in)
-    D_core = w_core * Dh_core + (1.0 - w_core) * D_light_core
-
-    D_ref = D_light.clone()
-    for n, (b, y0, x0) in enumerate(coords):
-        D_ref[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE] = D_core[n:n + 1]
-
-    W_global = build_w_global(M)
-    D_final = (1.0 - W_global) * D_light + W_global * D_ref
-    return D_final, D_light, C_full, w_core, M_core
+    D_final_full, count = scatter_patch_to_full(
+        D_final_patch, tiles_tensor, B=B, H=H, W=W, stride=STRIDE, D_light_fallback=D_light
+    )
+    return D_final_full, D_light, C_full, delta, Dh, M_ctx
 
 
-def run_epoch(stage, loader, light, heavy, fusion, optimizer, args, device, train=True):
+def run_epoch(stage, loader, light, heavy, optimizer, args, device, train=True):
     if stage == "A":
         light.train(train)
         if heavy is not None:
             heavy.eval()
-        if fusion is not None:
-            fusion.eval()
+        pass
     elif stage == "B":
         light.eval()
         if heavy is not None:
             heavy.train(train)
-        if fusion is not None:
-            fusion.train(train)
+        pass
     else:
         raise ValueError(f"Unsupported stage: {stage}")
 
@@ -207,6 +231,7 @@ def run_epoch(stage, loader, light, heavy, fusion, optimizer, args, device, trai
     error_sum = utils.init_error_metrics()
 
     tbar = tqdm(loader)
+    printed_debug = False
     for batch in tbar:
         I = batch["rgb"].to(device)
         D_in = batch["depth"].to(device)
@@ -232,25 +257,46 @@ def run_epoch(stage, loader, light, heavy, fusion, optimizer, args, device, trai
                 loss = L_light + args.lambda_c_a * L_conf
                 output = D_light
             elif stage == "B":
-                D_final, _, _, w_core, M_core = forward_v2(light, heavy, fusion, I, D_in, M, grad_light=False)
-                eps = 1e-6
-                hole_sum = torch.sum(M) + eps
-                L_hole = torch.sum(torch.abs(D_final - D_gt) * M) / hole_sum
-
-                Md = dilate_mask(M, r=8)
-                dx_pred = D_final[:, :, :, 1:] - D_final[:, :, :, :-1]
-                dx_gt = D_gt[:, :, :, 1:] - D_gt[:, :, :, :-1]
-                dy_pred = D_final[:, :, 1:, :] - D_final[:, :, :-1, :]
-                dy_gt = D_gt[:, :, 1:, :] - D_gt[:, :, :-1, :]
-                Md_x = Md[:, :, :, 1:]
-                Md_y = Md[:, :, 1:, :]
-                grad_x_sum = torch.sum(Md_x) + eps
-                grad_y_sum = torch.sum(Md_y) + eps
-                L_grad = (
-                    torch.sum(torch.abs(dx_pred - dx_gt) * Md_x) / grad_x_sum
-                    + torch.sum(torch.abs(dy_pred - dy_gt) * Md_y) / grad_y_sum
+                D_final, D_light, _, delta, Dh, M_patch = forward_v2(
+                    light, heavy, I, D_in, M, grad_light=False, D_max=args.depth_max_m
                 )
-                loss = L_hole + 0.3 * L_grad
+                if not printed_debug:
+                    with torch.no_grad():
+                        pooled = F.max_pool2d(M, kernel_size=PATCH_SIZE, stride=STRIDE)
+                        tiles_count = int((pooled > 0).sum().item())
+                        w_global = build_w_global(M)
+                        print(
+                            f"[debug][stage B] M mean={M.mean().item():.6f} "
+                            f"tiles={tiles_count} W_global mean={w_global.mean().item():.6f}"
+                        )
+                        head_mean = float(heavy.head.weight.abs().mean().item())
+                        print(
+                            f"[debug][stage B] heavy.head |W| mean={head_mean:.6f}"
+                        )
+                        if D_light is not None:
+                            dlight_max = float(D_light.max().item())
+                            dh_max = float(Dh.max().item()) if Dh is not None else 0.0
+                            hole_patch = (M_patch > 0.5) if M_patch is not None else None
+                            if hole_patch is not None and hole_patch.any():
+                                delta_abs_mean = float(delta.abs()[hole_patch].mean().item())
+                            else:
+                                delta_abs_mean = float(delta.abs().mean().item())
+                            delta_abs_max = float(delta.abs().max().item())
+                            print(
+                                f"[debug][stage B] D_light max={dlight_max:.6f} "
+                                f"Dh max={dh_max:.6f} delta_abs_mean={delta_abs_mean:.6f} "
+                                f"delta_abs_max={delta_abs_max:.6f}"
+                            )
+                eps = 1e-6
+                hole_full = (M > 0.5).float()
+                ring = torch.clamp(dilate_mask(hole_full, r=3) - hole_full, 0.0, 1.0)
+                diff = torch.abs(D_final - D_gt) * hole_full
+                L_depth = diff.sum() / (hole_full.sum() + eps)
+                L_grad = gradient_consistency_loss(D_final, D_gt, ring, eps=eps)
+                if not printed_debug:
+                    print(f"[debug][stage B] L_depth={L_depth:.6f} L_grad={L_grad:.6f}")
+                    printed_debug = True
+                loss = L_depth + LAMBDA_GRAD * L_grad
                 output = D_final
             else:
                 raise ValueError(f"Unsupported stage: {stage}")
@@ -260,8 +306,7 @@ def run_epoch(stage, loader, light, heavy, fusion, optimizer, args, device, trai
             if stage == "A":
                 torch.nn.utils.clip_grad_norm_(light.parameters(), args.grad_clip)
             elif stage == "B":
-                params = list(heavy.parameters()) + list(fusion.parameters())
-                torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
+                torch.nn.utils.clip_grad_norm_(heavy.parameters(), args.grad_clip)
             else:
                 raise ValueError(f"Unsupported stage: {stage}")
             optimizer.step()
@@ -277,7 +322,7 @@ def run_epoch(stage, loader, light, heavy, fusion, optimizer, args, device, trai
     return avg_loss, error_avg
 
 
-def train_stage(stage, light, heavy, fusion, train_loader, eval_loader, args, device, save_dir, run_id):
+def train_stage(stage, light, heavy, train_loader, eval_loader, args, device, save_dir, run_id):
     best_rmse = float("inf")
     loss_log = os.path.join(save_dir, f"loss_stage_{stage.lower()}_{run_id}.txt")
     if not os.path.isfile(loss_log):
@@ -294,7 +339,7 @@ def train_stage(stage, light, heavy, fusion, train_loader, eval_loader, args, de
         )
     elif stage == "B":
         optimizer = torch.optim.AdamW(
-            list(heavy.parameters()) + list(fusion.parameters()),
+            list(heavy.parameters()),
             lr=args.lr_heavy_b,
             weight_decay=args.weight_decay,
         )
@@ -307,8 +352,8 @@ def train_stage(stage, light, heavy, fusion, train_loader, eval_loader, args, de
         raise ValueError(f"Unsupported stage: {stage}")
 
     for epoch in range(1, epochs + 1):
-        train_loss, train_error = run_epoch(stage, train_loader, light, heavy, fusion, optimizer, args, device, train=True)
-        eval_loss, eval_error = run_epoch(stage, eval_loader, light, heavy, fusion, optimizer, args, device, train=False)
+        train_loss, train_error = run_epoch(stage, train_loader, light, heavy, optimizer, args, device, train=True)
+        eval_loss, eval_error = run_epoch(stage, eval_loader, light, heavy, optimizer, args, device, train=False)
 
         is_best = eval_error["RMSE"] < best_rmse
         if is_best:
@@ -319,8 +364,6 @@ def train_stage(stage, light, heavy, fusion, train_loader, eval_loader, args, de
             elif stage == "B":
                 torch.save(heavy.state_dict(), ckpt_path)
                 torch.save(heavy.state_dict(), os.path.join(save_dir, "heavy_best.pth"))
-                torch.save(fusion.state_dict(), os.path.join(save_dir, "fusion_best_b.pth"))
-                torch.save(fusion.state_dict(), os.path.join(save_dir, "fusion_best.pth"))
             else:
                 raise ValueError(f"Unsupported stage: {stage}")
 
@@ -385,10 +428,14 @@ def main():
 
     parser.add_argument("--light_ckpt", default=DEFAULTS["light_ckpt"], type=str)
     parser.add_argument("--heavy_ckpt", default=DEFAULTS["heavy_ckpt"], type=str)
-    parser.add_argument("--fusion_ckpt", default=DEFAULTS["fusion_ckpt"], type=str)
 
     args = parser.parse_args()
     apply_cfg_overrides(args, _cfg)
+
+    cfg = load_dataset_config(args.dataset_cfg)
+    dataset_name = resolve_dataset_name(args.datasets, cfg)
+    ds_cfg = cfg.get("datasets", {}).get(dataset_name, {})
+    args.depth_max_m = float(ds_cfg.get("depth_max_m", 5.0))
 
     save_dir = os.path.join(args.project_root, f"result_{args.datasets}")
     utils.log_file_folder_make_lr(save_dir)
@@ -396,7 +443,7 @@ def main():
     dataset_root = resolve_dataset_root(args.datasets, args.dataset_cfg, args.data_root)
     print(f"==> Loading dataset from: {dataset_root}")
     dataset_train = build_dataset(args.datasets, "train", args.dataset_cfg, args.data_root)
-    dataset_test = build_dataset(args.datasets, "train", args.dataset_cfg, args.data_root)
+    dataset_test = build_dataset(args.datasets, "test", args.dataset_cfg, args.data_root)
 
     def make_loaders(batch_train, batch_eval):
         train_loader = DataLoader(
@@ -418,13 +465,12 @@ def main():
 
     light = GlobalProxyNet().to(device)
     heavy = None
-    fusion = None
 
     run_id = time.strftime("%Y%m%d_%H%M%S")
 
     if args.stage in ["A", "all"]:
         train_loader, eval_loader = make_loaders(args.batch_size_train_a, args.batch_size_eval_a)
-        train_stage("A", light, None, None, train_loader, eval_loader, args, device, save_dir, run_id)
+        train_stage("A", light, None, train_loader, eval_loader, args, device, save_dir, run_id)
 
     if args.stage in ["B", "all"]:
         set_requires_grad(light, False)
@@ -447,14 +493,8 @@ def main():
                 theta_h=args.theta_h,
                 s0=args.s0,
             ).to(device)
-        if fusion is None:
-            fusion = TinyFusionHead().to(device)
-        fusion_ckpt = args.fusion_ckpt
-        if fusion_ckpt:
-            if not load_checkpoint(fusion, fusion_ckpt, device):
-                raise FileNotFoundError(f"Fusion checkpoint not found: {fusion_ckpt}")
         train_loader, eval_loader = make_loaders(args.batch_size_train_b, args.batch_size_eval_b)
-        train_stage("B", light, heavy, fusion, train_loader, eval_loader, args, device, save_dir, run_id)
+        train_stage("B", light, heavy, train_loader, eval_loader, args, device, save_dir, run_id)
 
     # Stage C is disabled; use Stage A + B as the final model.
 

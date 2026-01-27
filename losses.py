@@ -79,3 +79,19 @@ def edge_grad_loss(pred, target, mask=None):
             return loss / count
 
     return diff_x.mean() + diff_y.mean()
+
+
+def gradient_2d(x):
+    dx = x[:, :, :, 1:] - x[:, :, :, :-1]
+    dy = x[:, :, 1:, :] - x[:, :, :-1, :]
+    return dx, dy
+
+
+def gradient_consistency_loss(pred, gt, mask, eps=1e-6):
+    dxp, dyp = gradient_2d(pred)
+    dxg, dyg = gradient_2d(gt)
+    mask_x = mask[:, :, :, 1:]
+    mask_y = mask[:, :, 1:, :]
+    loss_x = (torch.abs(dxp - dxg) * mask_x).sum() / (mask_x.sum() + eps)
+    loss_y = (torch.abs(dyp - dyg) * mask_y).sum() / (mask_y.sum() + eps)
+    return loss_x + loss_y

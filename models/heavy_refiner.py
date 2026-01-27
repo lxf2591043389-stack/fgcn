@@ -178,7 +178,6 @@ class HeavyRefineHead(nn.Module):
         self.head = nn.Conv2d(ch0, 1, kernel_size=1, stride=1, padding=0)
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
-        self.softplus = nn.Softplus()
 
     def forward(self, I_patch, D_in_patch, D_light_patch, C_patch):
         G0 = self.guide_stem(I_patch)
@@ -216,5 +215,4 @@ class HeavyRefineHead(nn.Module):
         x_up1, _ = self.dec1(x_up1, D_light_patch, C_up1, G0)
 
         delta = self.head(x_up1)
-        Dh = self.softplus(D_light_patch + delta)
-        return Dh
+        return delta

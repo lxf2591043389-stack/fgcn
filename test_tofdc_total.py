@@ -8,11 +8,10 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from dataset_factory import build_dataset
+from dataset_factory import build_dataset, load_dataset_config, resolve_dataset_name
 import utils
 from models.light_proxy_net import GlobalProxyNet
 from models.heavy_refiner import HeavyRefineHead
-from models.tiny_fusion_head import TinyFusionHead
 from test_tofdc_config import RUN_CONFIG_PATH, add_base_args, add_heavy_args, add_scheduler_args
 from config_utils import load_run_config
 
@@ -21,69 +20,20 @@ try:
 except Exception:
     profile = None
 
-SAFE_THRESH = 0.6
-BUFFER = 0.1
 PATCH_SIZE = 32
-CONTEXT = 48
-PAD_CTX = 8
 STRIDE = 32
+DELTA_SCALE = 1.0
 
 
 def count_params(model):
     return sum(p.numel() for p in model.parameters())
 
 
-def crop_tile_patches(I, D_in, D_light, M, C_init, tiles, stride=PATCH_SIZE):
-    bsz = I.shape[0]
+def scatter_patch_to_full(D_patch, tiles, B, H, W, stride, D_light_fallback):
     ksz = tiles.shape[1]
-    tiles_list = tiles.detach().cpu().tolist()
-
-    I_patches = []
-    D_in_patches = []
-    D_light_patches = []
-    M_patches = []
-    C_patches = []
-
-    for b in range(bsz):
-        for k in range(ksz):
-            i, j = tiles_list[b][k]
-            y0 = int(i) * stride
-            x0 = int(j) * stride
-            if y0 + PATCH_SIZE > I.shape[2] or x0 + PATCH_SIZE > I.shape[3]:
-                continue
-            I_patch = I[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE]
-            D_in_patch = D_in[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE]
-            D_light_patch = D_light[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE]
-            M_patch = M[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE]
-
-            c_stride = stride // 4
-            c_size = PATCH_SIZE // 4
-            y1 = int(i) * c_stride
-            x1 = int(j) * c_stride
-            C_tile = C_init[b:b + 1, :, y1:y1 + c_size, x1:x1 + c_size]
-            C_patch = F.interpolate(C_tile, size=(PATCH_SIZE, PATCH_SIZE), mode="bilinear", align_corners=False)
-
-            I_patches.append(I_patch)
-            D_in_patches.append(D_in_patch)
-            D_light_patches.append(D_light_patch)
-            M_patches.append(M_patch)
-            C_patches.append(C_patch)
-
-    if not I_patches:
-        return None, None, None, None, None
-    I_patch = torch.cat(I_patches, dim=0)
-    D_in_patch = torch.cat(D_in_patches, dim=0)
-    D_light_patch = torch.cat(D_light_patches, dim=0)
-    M_patch = torch.cat(M_patches, dim=0)
-    C_patch = torch.cat(C_patches, dim=0)
-    return I_patch, D_in_patch, D_light_patch, M_patch, C_patch
-
-
-def scatter_residual(res_patch, tiles, B, H=192, W=288, stride=PATCH_SIZE):
-    ksz = tiles.shape[1]
-    res_full = res_patch.new_zeros((B, 1, H, W))
-    count = res_patch.new_zeros((B, 1, H, W))
-    res_patch = res_patch.view(B, ksz, 1, 32, 32)
+    full = D_patch.new_zeros((B, 1, H, W))
+    count = D_patch.new_zeros((B, 1, H, W))
+    D_patch = D_patch.view(B, ksz, 1, PATCH_SIZE, PATCH_SIZE)
     tiles_list = tiles.detach().cpu().tolist()
 
     for b in range(B):
@@ -91,65 +41,18 @@ def scatter_residual(res_patch, tiles, B, H=192, W=288, stride=PATCH_SIZE):
             i, j = tiles_list[b][k]
             y0 = int(i) * stride
             x0 = int(j) * stride
-            if y0 + PATCH_SIZE > H or x0 + PATCH_SIZE > W:
-                continue
-            res_full[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE] += res_patch[b, k]
+            full[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE] += D_patch[b, k]
             count[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE] += 1.0
 
-    res_full = res_full / torch.clamp(count, min=1.0)
-    return res_full
+    out = full / torch.clamp(count, min=1.0)
+    out = torch.where(count > 0, out, D_light_fallback)
+    return out, count
 
 
-def compute_update_mask(mask_hole, conf, safe_thresh=SAFE_THRESH, buffer=BUFFER):
-    soft_edge = torch.clamp((safe_thresh - conf) / buffer, 0.0, 1.0)
-    return torch.max(mask_hole, soft_edge)
-
-
-def expand_tiles_for_overlap(tiles, H, W, base_stride=PATCH_SIZE, stride=STRIDE):
-    bsz = tiles.shape[0]
-    tiles_list = tiles.detach().cpu().tolist()
-    expanded = []
-    max_len = 0
-    for b in range(bsz):
-        coords = set()
-        for i, j in tiles_list[b]:
-            y0 = int(i) * base_stride
-            x0 = int(j) * base_stride
-            for dy in (0, stride):
-                for dx in (0, stride):
-                    yy = y0 + dy
-                    xx = x0 + dx
-                    if yy + PATCH_SIZE <= H and xx + PATCH_SIZE <= W:
-                        coords.add((yy // stride, xx // stride))
-        if not coords:
-            coords = {(0, 0)}
-        coords_list = sorted(coords)
-        expanded.append(coords_list)
-        max_len = max(max_len, len(coords_list))
-
-    out = torch.zeros((bsz, max_len, 2), dtype=torch.long, device=tiles.device)
-    for b in range(bsz):
-        coords_list = expanded[b]
-        if len(coords_list) < max_len:
-            coords_list = coords_list + [coords_list[-1]] * (max_len - len(coords_list))
-        out[b] = torch.tensor(coords_list, dtype=torch.long, device=tiles.device)
-    return out
-
-
-def build_w_global(mask):
-    w = mask.clone()
-    prev = mask
-    for r, weight in [(2, 0.7), (4, 0.4), (8, 0.2)]:
-        dil = F.max_pool2d(prev, kernel_size=2 * r + 1, stride=1, padding=r)
-        ring = torch.clamp(dil - prev, 0.0, 1.0)
-        w = w + weight * ring
-        prev = dil
-    return torch.clamp(w, 0.0, 1.0)
-
-
-def forward_v2(light, heavy, fusion, I, D_in, M):
+def forward_v2(light, heavy, I, D_in, M, D_max):
     D_light, C_init = light(I, D_in, M)
     H, W = I.shape[2], I.shape[3]
+    D_light = torch.clamp(D_light, 0.0, D_max)
     C_full = F.interpolate(C_init, size=(H, W), mode="bilinear", align_corners=False)
 
     pooled = F.max_pool2d(M, kernel_size=PATCH_SIZE, stride=STRIDE)
@@ -157,30 +60,39 @@ def forward_v2(light, heavy, fusion, I, D_in, M):
     if tiles.numel() == 0:
         return D_light, D_light, C_full, [0 for _ in range(I.shape[0])]
 
-    I_pad = F.pad(I, (PAD_CTX, PAD_CTX, PAD_CTX, PAD_CTX), mode="replicate")
-    D_in_pad = F.pad(D_in, (PAD_CTX, PAD_CTX, PAD_CTX, PAD_CTX), mode="replicate")
-    D_light_pad = F.pad(D_light, (PAD_CTX, PAD_CTX, PAD_CTX, PAD_CTX), mode="replicate")
-    C_pad = F.pad(C_full, (PAD_CTX, PAD_CTX, PAD_CTX, PAD_CTX), mode="replicate")
-    M_pad = F.pad(M, (PAD_CTX, PAD_CTX, PAD_CTX, PAD_CTX), mode="replicate")
+    B = I.shape[0]
+    tiles_list = tiles.detach().cpu().tolist()
+    tiles_by_b = [[] for _ in range(B)]
+    for t in tiles_list:
+        b, i, j = int(t[0]), int(t[2]), int(t[3])
+        tiles_by_b[b].append((i, j))
+    max_k = max((len(v) for v in tiles_by_b), default=0)
+    if max_k == 0:
+        return D_light, D_light, C_full, [0 for _ in range(I.shape[0])]
+
+    tiles_tensor = torch.zeros((B, max_k, 2), dtype=torch.long, device=I.device)
+    for b in range(B):
+        tlist = tiles_by_b[b]
+        if not tlist:
+            tlist = [(0, 0)]
+        if len(tlist) < max_k:
+            tlist = tlist + [tlist[-1]] * (max_k - len(tlist))
+        tiles_tensor[b] = torch.tensor(tlist, dtype=torch.long, device=I.device)
 
     I_patches = []
     D_in_patches = []
     D_light_patches = []
     C_patches = []
     M_patches = []
-    coords = []
-    for t in tiles:
-        b = int(t[0])
-        i = int(t[2])
-        j = int(t[3])
-        y0 = i * STRIDE
-        x0 = j * STRIDE
-        I_patches.append(I_pad[b:b + 1, :, y0:y0 + CONTEXT, x0:x0 + CONTEXT])
-        D_in_patches.append(D_in_pad[b:b + 1, :, y0:y0 + CONTEXT, x0:x0 + CONTEXT])
-        D_light_patches.append(D_light_pad[b:b + 1, :, y0:y0 + CONTEXT, x0:x0 + CONTEXT])
-        C_patches.append(C_pad[b:b + 1, :, y0:y0 + CONTEXT, x0:x0 + CONTEXT])
-        M_patches.append(M_pad[b:b + 1, :, y0:y0 + CONTEXT, x0:x0 + CONTEXT])
-        coords.append((b, y0, x0))
+    for b in range(B):
+        for i, j in tiles_by_b[b]:
+            y0 = i * STRIDE
+            x0 = j * STRIDE
+            I_patches.append(I[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE])
+            D_in_patches.append(D_in[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE])
+            D_light_patches.append(D_light[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE])
+            C_patches.append(C_full[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE])
+            M_patches.append(M[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE])
 
     I_ctx = torch.cat(I_patches, dim=0)
     D_in_ctx = torch.cat(D_in_patches, dim=0)
@@ -188,26 +100,17 @@ def forward_v2(light, heavy, fusion, I, D_in, M):
     C_ctx = torch.cat(C_patches, dim=0)
     M_ctx = torch.cat(M_patches, dim=0)
 
-    Dh_ctx = heavy(I_ctx, D_in_ctx, D_light_ctx, C_ctx)
-    Dh_core = Dh_ctx[:, :, PAD_CTX:PAD_CTX + PATCH_SIZE, PAD_CTX:PAD_CTX + PATCH_SIZE]
-    D_light_core = D_light_ctx[:, :, PAD_CTX:PAD_CTX + PATCH_SIZE, PAD_CTX:PAD_CTX + PATCH_SIZE]
-    M_core = M_ctx[:, :, PAD_CTX:PAD_CTX + PATCH_SIZE, PAD_CTX:PAD_CTX + PATCH_SIZE]
-    C_core = C_ctx[:, :, PAD_CTX:PAD_CTX + PATCH_SIZE, PAD_CTX:PAD_CTX + PATCH_SIZE]
+    delta_raw = heavy(I_ctx, D_in_ctx, D_light_ctx, C_ctx)
+    delta = DELTA_SCALE * torch.tanh(delta_raw)
+    Dh = torch.clamp(D_light_ctx + delta, 0.0, D_max)
+    hole_patch = (M_ctx > 0.5).float()
+    D_final_patch = torch.where(hole_patch > 0, Dh, D_light_ctx)
 
-    w_in = torch.cat([D_light_core, Dh_core, M_core, C_core], dim=1)
-    w_core = fusion(w_in)
-    D_core = w_core * Dh_core + (1.0 - w_core) * D_light_core
-
-    D_ref = D_light.clone()
-    for n, (b, y0, x0) in enumerate(coords):
-        D_ref[b:b + 1, :, y0:y0 + PATCH_SIZE, x0:x0 + PATCH_SIZE] = D_core[n:n + 1]
-
-    W_global = build_w_global(M)
-    D_final = (1.0 - W_global) * D_light + W_global * D_ref
-    k_counts = [0 for _ in range(I.shape[0])]
-    for b, _, _ in coords:
-        k_counts[b] += 1
-    return D_final, D_light, C_full, k_counts
+    D_final_full, count = scatter_patch_to_full(
+        D_final_patch, tiles_tensor, B=B, H=H, W=W, stride=STRIDE, D_light_fallback=D_light
+    )
+    k_counts = [len(v) for v in tiles_by_b]
+    return D_final_full, D_light, C_full, k_counts
 
 
 def load_state(model, path, device):
@@ -237,16 +140,17 @@ def resolve_heavy_ckpt(args, result_dir):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TOFDC test total (V2 refinement)")
+    parser = argparse.ArgumentParser(description="TOFDC test total (V2 hard replace)")
     add_base_args(parser)
     add_heavy_args(parser)
     add_scheduler_args(parser)
-    parser.add_argument("--fusion_ckpt", default="", type=str)
     args = parser.parse_args()
-    args.k_max = 32
-    args.risk_top_ratio = 0.02
 
     run_cfg = load_run_config(RUN_CONFIG_PATH)
+    cfg = load_dataset_config(args.dataset_cfg)
+    dataset_name = resolve_dataset_name(args.datasets, cfg)
+    ds_cfg = cfg.get("datasets", {}).get(dataset_name, {})
+    args.depth_max_m = float(ds_cfg.get("depth_max_m", 5.0))
 
     result_dir = os.path.join(args.project_root, f"result_{args.datasets}")
     run_id = time.strftime("%Y%m%d_%H%M%S")
@@ -259,18 +163,14 @@ def main():
 
     light = GlobalProxyNet().to(device)
     heavy = HeavyRefineHead().to(device)
-    fusion = TinyFusionHead().to(device)
 
     light_ckpt = resolve_light_ckpt(args, result_dir)
     heavy_ckpt = resolve_heavy_ckpt(args, result_dir)
     load_state(light, light_ckpt, device)
     load_state(heavy, heavy_ckpt, device)
-    fusion_ckpt = args.fusion_ckpt or os.path.join(result_dir, "fusion_best_b.pth")
-    load_state(fusion, fusion_ckpt, device)
 
     light.eval()
     heavy.eval()
-    fusion.eval()
 
     dataset = build_dataset(args.datasets, args.split, args.dataset_cfg, args.data_root)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
@@ -298,7 +198,7 @@ def main():
                 torch.cuda.synchronize()
             start = time.time()
 
-            D_pred, _, _, k_counts = forward_v2(light, heavy, fusion, I, D_in, M)
+            D_pred, _, _, k_counts = forward_v2(light, heavy, I, D_in, M, D_max=args.depth_max_m)
             k_values.extend(k_counts)
 
             if device.type == "cuda":
@@ -327,21 +227,19 @@ def main():
     k_avg = sum(k_values) / len(k_values) if k_values else 0.0
     light_params = count_params(light)
     heavy_params = count_params(heavy)
-    fusion_params = count_params(fusion)
-    total_params = light_params + heavy_params + fusion_params
+    total_params = light_params + heavy_params
     flops_light = None
     flops_heavy = None
     total_flops = None
     if profile is not None:
         flops_light, _ = profile(light, inputs=(I, D_in, M), verbose=False)
         patch_b = max(1, int(round(k_avg))) * args.batch_size
-        I_patch = torch.rand(patch_b, 3, CONTEXT, CONTEXT, device=device)
-        D_patch = torch.rand(patch_b, 1, CONTEXT, CONTEXT, device=device)
-        C_patch = torch.rand(patch_b, 1, CONTEXT, CONTEXT, device=device)
+        I_patch = torch.rand(patch_b, 3, PATCH_SIZE, PATCH_SIZE, device=device)
+        D_patch = torch.rand(patch_b, 1, PATCH_SIZE, PATCH_SIZE, device=device)
+        C_patch = torch.rand(patch_b, 1, PATCH_SIZE, PATCH_SIZE, device=device)
         flops_heavy, _ = profile(heavy, inputs=(I_patch, D_patch, D_patch, C_patch), verbose=False)
-        fusion_in = torch.rand(patch_b, 4, PATCH_SIZE, PATCH_SIZE, device=device)
-        flops_fusion, _ = profile(fusion, inputs=(fusion_in,), verbose=False)
-        total_flops = flops_light + flops_heavy + flops_fusion
+        total_flops = flops_light + flops_heavy
+
     summary_path = os.path.join(save_dir, "summary.txt")
     with open(summary_path, "w") as f:
         f.write("=== Test Total Results ===\n")
@@ -361,7 +259,6 @@ def main():
         f.write("\n=== Checkpoints ===\n")
         f.write(f"light_ckpt: {light_ckpt}\n")
         f.write(f"heavy_ckpt: {heavy_ckpt}\n")
-        f.write(f"fusion_ckpt: {fusion_ckpt}\n")
         f.write("\n=== Args ===\n")
         f.write(json.dumps(vars(args), sort_keys=True, indent=2, ensure_ascii=True))
         f.write("\n")
