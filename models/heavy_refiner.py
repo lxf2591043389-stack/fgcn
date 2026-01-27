@@ -175,11 +175,10 @@ class HeavyRefineHead(nn.Module):
         )
         self.dec1 = FGNCBlock(ch0, guide_ch=guide_ch, ks=ks, alpha=alpha, beta=beta, gamma=gamma, theta_l=theta_l, theta_h=theta_h, s0=s0)
 
-        self.head = nn.Conv2d(ch0, 2, kernel_size=1, stride=1, padding=0)
+        self.head = nn.Conv2d(ch0, 1, kernel_size=1, stride=1, padding=0)
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
-        with torch.no_grad():
-            self.head.bias[1].fill_(-5.0)
+        self.softplus = nn.Softplus()
 
     def forward(self, I_patch, D_in_patch, D_light_patch, C_patch):
         G0 = self.guide_stem(I_patch)
@@ -204,17 +203,18 @@ class HeavyRefineHead(nn.Module):
         x3, c3 = self.bottleneck1(x3_in, D8, C8, G8)
         x3, c3 = self.bottleneck2(x3, D8, c3, G8)
 
-        x_up2 = F.interpolate(x3, size=(16, 16), mode="bilinear", align_corners=False)
+        x_up2 = F.interpolate(x3, size=x2.shape[2:], mode="bilinear", align_corners=False)
         x_up2 = torch.cat([x_up2, x2], dim=1)
         x_up2 = self.up2_reduce(x_up2)
-        C_up2 = F.interpolate(C8, size=(16, 16), mode="nearest")
+        C_up2 = F.interpolate(C8, size=x2.shape[2:], mode="nearest")
         x_up2, _ = self.dec2(x_up2, D16, C_up2, G16)
 
-        x_up1 = F.interpolate(x_up2, size=(32, 32), mode="bilinear", align_corners=False)
+        x_up1 = F.interpolate(x_up2, size=x1.shape[2:], mode="bilinear", align_corners=False)
         x_up1 = torch.cat([x_up1, x1], dim=1)
         x_up1 = self.up1_reduce(x_up1)
-        C_up1 = F.interpolate(C16, size=(32, 32), mode="nearest")
+        C_up1 = F.interpolate(C16, size=x1.shape[2:], mode="nearest")
         x_up1, _ = self.dec1(x_up1, D_light_patch, C_up1, G0)
 
-        out = self.head(x_up1)
-        return out
+        delta = self.head(x_up1)
+        Dh = self.softplus(D_light_patch + delta)
+        return Dh
